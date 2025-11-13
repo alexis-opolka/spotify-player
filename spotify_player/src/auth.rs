@@ -3,7 +3,7 @@ use anyhow::Result;
 use librespot_core::{authentication::Credentials, cache::Cache, config::SessionConfig, Session};
 use librespot_oauth::OAuthClientBuilder;
 
-pub const SPOTIFY_CLIENT_ID: &str = "c7e3680def2641118ef2b0983de21ca8";
+pub const SPOTIFY_CLIENT_ID: &str = "951a2757fb804e8e84de590e672fa8ac";
 // based on https://github.com/librespot-org/librespot/blob/f96f36c064795011f9fee912291eecb1aa46fff6/src/main.rs#L173
 const OAUTH_SCOPES: &[&str] = &[
     // Spotify Connect
@@ -28,8 +28,6 @@ const OAUTH_SCOPES: &[&str] = &[
     // Library
     "user-library-modify",
     "user-library-read",
-    // Users
-    "user-personalized",
 ];
 
 #[derive(Clone)]
