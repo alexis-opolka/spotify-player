@@ -34,6 +34,7 @@ mod spotify;
 pub use handlers::*;
 pub use request::*;
 use serde::Deserialize;
+pub(crate) use spotify::WebApiClient;
 
 const SPOTIFY_API_ENDPOINT: &str = "https://api.spotify.com/v1";
 const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
@@ -48,19 +49,63 @@ pub struct AppClient {
     /// The integrated Spotify client, mainly used for streaming and librespot integration
     spotify: Arc<spotify::Spotify>,
     auth_config: AuthConfig,
-    /// The user-provided Spotify client, mainly used for interacting with Spotify Web APIs
-    user_client: Option<rspotify::AuthCodePkceSpotify>,
+    /// The Spotify Web API client, used for interacting with Spotify Web APIs
+    api_client: WebApiClient,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
 }
 
 impl Deref for AppClient {
-    type Target = rspotify::AuthCodePkceSpotify;
+    type Target = WebApiClient;
     fn deref(&self) -> &Self::Target {
-        self.user_client
-            .as_ref()
-            .expect("user-provided client should be initialized")
+        &self.api_client
     }
+}
+
+/// Build the Spotify Web API client from the configured client ID.
+///
+/// The returned client is unauthenticated; call [`auth::prompt_for_user_token`] to obtain an
+/// access token.
+pub fn new_api_client() -> Result<WebApiClient> {
+    let configs = config::get_config();
+
+    let id = configs.app_config.get_client_id()?;
+    // The bundled default (ncspot's client ID) is registered with extended quota mode and
+    // predates Spotify's 2024 Web API changes, so it is far less likely to hit rate limits
+    // than a freshly-registered client. Warn users who override it that they may run into
+    // `429 Too Many Requests` / `403 Forbidden` errors.
+    //
+    // See https://github.com/aome510/spotify-player/issues/890 for details.
+    if id != auth::NCSPOT_CLIENT_ID {
+        tracing::warn!(
+            "A custom `client_id` ({id}) is configured. Newly-registered Spotify clients \
+             use the restricted default quota mode and may hit rate-limit (429) or \
+             forbidden (403) errors. Unless you specifically need your own client, \
+             consider removing `client_id`/`client_id_command` to use the bundled default. \
+             See https://github.com/aome510/spotify-player/issues/890 for details."
+        );
+    }
+
+    let creds = rspotify::Credentials { id, secret: None };
+    let mut scopes = auth::OAUTH_SCOPES
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    // `user-personalized` scope is not supported by the Web API client and only available to the official Spotify client
+    scopes.remove("user-personalized");
+    let oauth = rspotify::OAuth {
+        redirect_uri: configs.app_config.login_redirect_uri.clone(),
+        scopes,
+        ..Default::default()
+    };
+    let config = rspotify::Config {
+        token_cached: true,
+        cache_path: configs.cache_folder.join("user_client_token.json"),
+        ..Default::default()
+    };
+    Ok(WebApiClient::new(
+        rspotify::AuthCodePkceSpotify::with_config(creds, oauth, config),
+    ))
 }
 
 impl AppClient {
@@ -69,42 +114,16 @@ impl AppClient {
         let configs = config::get_config();
         let auth_config = AuthConfig::new(configs)?;
 
-        let mut user_client = configs.app_config.get_user_client_id()?.clone().map(|id| {
-            let creds = rspotify::Credentials { id, secret: None };
-            let mut scopes = auth::OAUTH_SCOPES
-                .iter()
-                .map(ToString::to_string)
-                .collect::<HashSet<_>>();
-            // `user-personalized` scope is not supported by user-provided client and only available to the official Spotify client
-            scopes.remove("user-personalized");
-            let oauth = rspotify::OAuth {
-                redirect_uri: configs.app_config.login_redirect_uri.clone(),
-                scopes,
-                ..Default::default()
-            };
-            let config = rspotify::Config {
-                token_cached: true,
-                cache_path: configs.cache_folder.join("user_client_token.json"),
-                ..Default::default()
-            };
-            rspotify::AuthCodePkceSpotify::with_config(creds, oauth, config)
-        });
-
-        if let Some(client) = &mut user_client {
-            let url = client
-                .get_authorize_url(None)
-                .context("get authorize URL for user-provided client")?;
-            client
-                .prompt_for_token(&url)
-                .await
-                .context("get token for user-provided client")?;
-        }
+        let mut api_client = new_api_client()?;
+        auth::prompt_for_user_token(&mut api_client, false)
+            .await
+            .context("authenticate Spotify Web API client")?;
 
         Ok(Self {
             spotify: Arc::new(spotify::Spotify::new()),
             http: reqwest::Client::new(),
             auth_config,
-            user_client,
+            api_client,
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
@@ -124,8 +143,10 @@ impl AppClient {
             .clone())
     }
 
-    /// Initialize the application's playback upon creating a new session or during startup
-    pub fn initialize_playback(&self, state: &SharedState) {
+    /// Initialize the application's playback upon creating a new session or during startup.
+    ///
+    /// `resume` controls whether playback should be (re)started on the device we connect to.
+    pub fn initialize_playback(&self, state: &SharedState, resume: bool) {
         tokio::task::spawn({
             let client = self.clone();
             let state = state.clone();
@@ -160,11 +181,20 @@ impl AppClient {
                     };
 
                     if let Some(id) = id {
-                        tracing::info!("Trying to connect to device (id={id})");
+                        tracing::info!("Trying to connect to device (id={id}, resume={resume})");
                         if let Err(err) = client.transfer_playback(&id, Some(false)).await {
                             tracing::warn!("Connection failed (device_id={id}): {err:#}");
                         } else {
                             tracing::info!("Connection succeeded (device_id={id})!");
+                            if resume {
+                                if let Err(err) =
+                                    client.resume_playback(Some(id.as_ref()), None).await
+                                {
+                                    tracing::warn!(
+                                        "Failed to resume playback after reconnect: {err:#}"
+                                    );
+                                }
+                            }
                             // upon new connection, reset the buffered playback
                             state.player.write().buffered_playback = None;
                             client.update_playback(&state);
@@ -178,6 +208,19 @@ impl AppClient {
 
     /// Create a new client session
     pub async fn new_session(&self, state: Option<&SharedState>, reauth: bool) -> Result<()> {
+        // Capture whether playback was active *before* tearing down any existing streaming
+        // connection. Shutting down the old `librespot` spirc pauses playback Spotify-side
+        // (and a broken session leaves it paused too), so we use this to resume on the new
+        // device rather than reconnecting in a paused state.
+        let was_playing = state.is_some_and(|state| {
+            state
+                .player
+                .read()
+                .buffered_playback
+                .as_ref()
+                .is_some_and(|p| p.is_playing)
+        });
+
         let session = self.auth_config.session();
         let creds = auth::get_creds(&self.auth_config, reauth, true).context("get credentials")?;
         self.spotify.set_session(session.clone()).await;
@@ -205,12 +248,14 @@ impl AppClient {
 
         tracing::info!("Used a new session for Spotify client.");
 
-        self.refresh_token().await.context("refresh auth token")?;
+        if let Err(err) = self.refresh_token().await {
+            tracing::warn!("Failed to refresh auth token after creating a new session: {err:#}");
+        }
 
         if let Some(state) = state {
             // reset the application's caches
             state.data.write().caches = MemoryCaches::new();
-            self.initialize_playback(state);
+            self.initialize_playback(state, was_playing);
         }
 
         Ok(())
@@ -246,6 +291,24 @@ impl AppClient {
         }
         *stream_conn = Some(new_conn);
         Ok(())
+    }
+
+    /// Pause the integrated streaming client, if a connection exists.
+    ///
+    /// Returns `true` if a streaming connection was present and the pause
+    /// command was issued. Used to suppress Spotify's auto-resume of the
+    /// previous session on startup when `pause_on_startup` is enabled.
+    #[cfg(feature = "streaming")]
+    pub fn pause_streaming_on_startup(&self) -> bool {
+        match self.stream_conn.lock().as_ref() {
+            Some(spirc) => {
+                if let Err(err) = spirc.pause() {
+                    tracing::warn!("Failed to pause integrated client on startup: {err:#}");
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Handle a player request, return a new playback metadata on success
@@ -417,24 +480,8 @@ impl AppClient {
                     .filter_map(Device::try_from_device)
                     .collect();
 
-                // Include the local streaming device when the streaming feature is enabled.
-                // This ensures the device list is never empty when using integrated playback,
-                // even if the user hasn't configured a custom client_id or if the Spotify API
-                // hasn't registered the device yet.
                 #[cfg(feature = "streaming")]
-                {
-                    let configs = config::get_config();
-                    let session = self.spotify.session().await;
-                    let local_device = Device {
-                        id: session.device_id().to_string(),
-                        name: configs.app_config.device.name.clone(),
-                    };
-
-                    // Only add if not already in the list (avoid duplicates)
-                    if !devices.iter().any(|d| d.id == local_device.id) {
-                        devices.push(local_device);
-                    }
-                }
+                self.ensure_integrated_device(&mut devices).await;
 
                 state.player.write().devices = devices;
             }
@@ -738,49 +785,62 @@ impl AppClient {
     /// Find an available device. If found, return the device's ID.
     async fn find_available_device(&self) -> Result<Option<String>> {
         let devices = self.available_devices().await?;
-        tracing::info!("Available devices: {devices:?}");
 
         // if there is an active device, return it
         if let Some(d) = devices.iter().find(|d| d.is_active) {
             return Ok(d.id.clone());
         }
 
-        // convert a vector of `Device` items into `(name, id)` pairs
+        #[allow(unused_mut)]
         let mut devices = devices
             .into_iter()
-            .filter_map(|d| d.id.map(|id| (d.name, id)))
+            .filter_map(Device::try_from_device)
             .collect::<Vec<_>>();
 
-        let configs = config::get_config();
-
-        // Manually append the integrated device to the device list if `streaming` feature is enabled.
-        // The integrated device may not show up in the device list returned by the Spotify API because
-        // 1. The device is just initialized and hasn't been registered in Spotify server.
-        //    Related issue/discussion: https://github.com/aome510/spotify-player/issues/79
-        // 2. The device list is empty. This might be because user doesn't specify their own client ID.
-        //    By default, the application uses Spotify web app's client ID, which doesn't have
-        //    access to user's active devices.
         #[cfg(feature = "streaming")]
-        {
-            let session = self.spotify.session().await;
-            devices.push((
-                configs.app_config.device.name.clone(),
-                session.device_id().to_string(),
-            ));
-        }
+        self.ensure_integrated_device(&mut devices).await;
+
+        tracing::info!("no active device found, available devices: {devices:?}");
 
         if devices.is_empty() {
             return Ok(None);
         }
 
-        // Prioritize the `default_device` specified in the application's configurations,
-        // otherwise, use the first available device.
+        // Prioritize the integrated device; otherwise, use the first available device.
         let id = devices
             .iter()
-            .position(|d| d.0 == configs.app_config.default_device)
+            .position(|d| d.is_integrated)
             .unwrap_or_default();
 
-        Ok(Some(devices.remove(id).1))
+        Ok(Some(devices.remove(id).id))
+    }
+
+    /// Ensures the integrated librespot device (of *this* running instance) is present in `devices`.
+    ///
+    /// The integrated device may not show up in the device list returned by the Spotify API because
+    /// 1. The device is just initialized and hasn't been registered in Spotify server.
+    ///    Related issue/discussion: <https://github.com/aome510/spotify-player/issues/79>
+    /// 2. The device list is empty. This might be because user doesn't specify their own client ID.
+    ///    By default, the application uses Spotify web app's client ID, which doesn't have
+    ///    access to user's active devices.
+    #[cfg(feature = "streaming")]
+    async fn ensure_integrated_device(&self, devices: &mut Vec<Device>) {
+        let session = self.spotify.session().await;
+        let session_device_id = session.device_id().to_string();
+
+        // Mark the integrated device if it's already in the list; otherwise, add it, so it's
+        // always present without duplicating an entry the API already returned.
+        match devices.iter_mut().find(|d| d.id == session_device_id) {
+            Some(device) => device.is_integrated = true,
+            None => devices.insert(
+                0,
+                Device {
+                    id: session_device_id,
+                    name: config::get_config().app_config.device.name.clone(),
+                    is_integrated: true,
+                },
+            ),
+        }
     }
 
     /// Get the saved (liked) tracks of the current user
@@ -999,10 +1059,21 @@ impl AppClient {
         let tracks = self
             .tracks(track_ids, Some(rspotify::model::Market::FromToken))
             .await?;
-        let tracks = tracks
+        let mut tracks: Vec<_> = tracks
             .into_iter()
             .filter_map(Track::try_from_full_track)
             .collect();
+
+        // Track-seeded radios in the official Spotify clients include the seed track itself
+        // as the first item in the generated session.
+        if let Ok(track_id) = TrackId::from_uri(&seed_uri) {
+            match self.track(track_id).await {
+                Ok(track) => move_seed_track_to_front(&mut tracks, track),
+                Err(err) => {
+                    tracing::warn!("Failed to fetch track radio seed {seed_uri}: {err:#}");
+                }
+            }
+        }
 
         Ok(tracks)
     }
@@ -1955,5 +2026,56 @@ impl AppClient {
         }
 
         albums
+    }
+}
+
+fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
+    tracks.retain(|track| track.id != seed_track.id);
+    tracks.insert(0, seed_track);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_seed_track_to_front;
+    use crate::state::Track;
+    use rspotify::model::TrackId;
+
+    fn sample_track(id: &'static str, name: &str) -> Track {
+        Track {
+            id: TrackId::from_id(id).unwrap().into_static(),
+            name: name.to_string(),
+            artists: vec![],
+            album: None,
+            duration: std::time::Duration::default(),
+            explicit: false,
+            added_at: 0,
+        }
+    }
+
+    #[test]
+    fn move_seed_track_to_front_prepends_missing_seed() {
+        let seed = sample_track("3n3Ppam7vgaVa1iaRUc9Lp", "seed");
+        let second = sample_track("4uLU6hMCjMI75M1A2tKUQC", "second");
+        let third = sample_track("1301WleyT98MSxVHPZCA6M", "third");
+        let mut tracks = vec![second.clone(), third];
+
+        move_seed_track_to_front(&mut tracks, seed.clone());
+
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].id, seed.id);
+        assert_eq!(tracks[1].id, second.id);
+    }
+
+    #[test]
+    fn move_seed_track_to_front_reorders_existing_seed_without_duplication() {
+        let seed = sample_track("3n3Ppam7vgaVa1iaRUc9Lp", "seed");
+        let second = sample_track("4uLU6hMCjMI75M1A2tKUQC", "second");
+        let mut tracks = vec![second.clone(), seed.clone()];
+
+        move_seed_track_to_front(&mut tracks, seed.clone());
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, seed.id);
+        assert_eq!(tracks[1].id, second.id);
     }
 }

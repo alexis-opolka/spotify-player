@@ -4,6 +4,7 @@ use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::DeviceType;
 use librespot_core::{spotify_uri, Session, SpotifyUri};
+use librespot_playback::audio_backend::Sink;
 use librespot_playback::mixer::MixerConfig;
 use librespot_playback::{
     audio_backend,
@@ -13,7 +14,15 @@ use librespot_playback::{
 };
 use rspotify::model::{EpisodeId, Id, PlayableId, TrackId};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Whether the next streaming connection is the first one of the process.
+///
+/// Used to scope `pause_on_startup` to application startup only, so that
+/// reconnecting mid-session (e.g. via `RestartIntegratedClient`) does not
+/// pause an intentionally playing track.
+static IS_FIRST_CONNECTION: AtomicBool = AtomicBool::new(true);
 
 #[cfg(not(any(
     feature = "rodio-backend",
@@ -188,17 +197,71 @@ pub async fn new_connection(
         session.device_id()
     );
 
-    let player = player::Player::new(
-        player_config,
-        session.clone(),
-        mixer.get_soft_volume(),
-        move || backend(None, AudioFormat::default()),
-    );
+    let player = {
+        // Clone the Option<Arc<...>> so the factory closure can move it.
+        // vis_bands is Some iff enable_audio_visualization is true.
+        let vis_bands = state.vis_bands.as_ref().map(Arc::clone);
+        player::Player::new(
+            player_config,
+            session.clone(),
+            mixer.get_soft_volume(),
+            move || -> Box<dyn Sink> {
+                let real = backend(None, AudioFormat::default());
+                if let Some(ref bands) = vis_bands {
+                    Box::new(crate::ui::streaming::VisualizationSink::new(
+                        real,
+                        Arc::clone(bands),
+                        // librespot defaults to 44100 Hz; adjust here if
+                        // PlayerConfig::sample_rate is changed in the future.
+                        44_100.0,
+                    ))
+                } else {
+                    real
+                }
+            },
+        )
+    };
+
+    // When `pause_on_startup` is enabled, suppress Spotify's auto-resume of the
+    // previous session by pausing the first auto-started playback. Scoped to the
+    // first connection of the process so mid-session reconnects are unaffected.
+    let pause_on_startup =
+        configs.app_config.pause_on_startup && IS_FIRST_CONNECTION.swap(false, Ordering::SeqCst);
 
     let player_event_task = tokio::task::spawn({
         let mut channel = player.get_player_event_channel();
         async move {
+            let mut pause_armed = pause_on_startup;
             while let Some(event) = channel.recv().await {
+                // Suppress Spotify's auto-resume of the previous session on
+                // startup. The `librespot` connect transfer finalizes the
+                // play state asynchronously, so a single reactive pause is not
+                // reliable on its own:
+                if pause_armed {
+                    match &event {
+                        // Best-effort: pause as the track starts loading, before
+                        // the audio sink starts, so no audible blip occurs. This
+                        // is a no-op if the transfer has not set the play state
+                        // yet, so we do NOT disarm here.
+                        player::PlayerEvent::Loading { .. } => {
+                            client.pause_streaming_on_startup();
+                        }
+                        // Authoritative: playback actually started (the transfer
+                        // finalized into "playing"). Pause and stop interfering.
+                        player::PlayerEvent::Playing { .. } => {
+                            if client.pause_streaming_on_startup() {
+                                pause_armed = false;
+                            }
+                        }
+                        // The track finished loading already paused, i.e. the
+                        // `Loading` pause above took effect and no audio played.
+                        player::PlayerEvent::Paused { .. } => {
+                            pause_armed = false;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match PlayerEvent::from_librespot_player_event(event) {
                     Err(err) => {
                         tracing::warn!("Failed to convert a `librespot` player event into `spotify_player` player event: {err:#}");
@@ -211,11 +274,17 @@ pub async fn new_connection(
                                 if let Some(playback) = player.buffered_playback.as_mut() {
                                     playback.is_playing = true;
                                 }
+                                if let Some(ref bands) = state.vis_bands {
+                                    bands.lock().is_active = true;
+                                }
                             }
                             PlayerEvent::Paused { .. } => {
                                 let mut player = state.player.write();
                                 if let Some(playback) = player.buffered_playback.as_mut() {
                                     playback.is_playing = false;
+                                }
+                                if let Some(ref bands) = state.vis_bands {
+                                    bands.lock().is_active = false;
                                 }
                             }
                             _ => {}

@@ -8,12 +8,12 @@ use crate::{
     key::{Key, KeySequence},
     state::{
         ActionListItem, Album, AlbumId, Artist, ArtistFocusState, ArtistId, ArtistPopupAction,
-        BrowsePageUIState, Context, ContextId, ContextPageType, ContextPageUIState, DataReadGuard,
-        Focusable, Id, Item, ItemId, LibraryFocusState, LibraryPageUIState, PageState, PageType,
-        PlayableId, Playback, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId,
-        PlaylistPopupAction, PopupState, SearchFocusState, SearchPageUIState, SharedState, ShowId,
-        Track, TrackId, TrackOrder, TracksId, UIStateGuard, USER_LIKED_TRACKS_ID,
-        USER_RECENTLY_PLAYED_TRACKS_ID, USER_TOP_TRACKS_ID,
+        BrowsePageUIState, ConfirmableAction, Context, ContextId, ContextPageType,
+        ContextPageUIState, DataReadGuard, Focusable, Id, Item, ItemId, LibraryFocusState,
+        LibraryPageUIState, PageState, PageType, PlayableId, Playback, PlaylistCreateCurrentField,
+        PlaylistFolderItem, PlaylistId, PlaylistPopupAction, PopupState, SearchFocusState,
+        SearchPageUIState, SharedState, ShowId, Track, TrackId, TrackOrder, TracksId, UIStateGuard,
+        USER_LIKED_TRACKS_ID, USER_RECENTLY_PLAYED_TRACKS_ID, USER_TOP_TRACKS_ID,
     },
     ui::{single_line_input::LineInput, Orientation},
     utils::parse_uri,
@@ -91,7 +91,7 @@ fn handle_mouse_event(
         // a left click event
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             let rect = state.ui.lock().playback_progress_bar_rect;
-            if event.row == rect.y {
+            if event.row == rect.y && event.column >= rect.x && event.column < rect.x + rect.width {
                 // calculate the seek position (in ms) based on the mouse click position,
                 // the progress bar's width and the track's duration (in ms)
                 let player = state.player.read();
@@ -101,7 +101,8 @@ fn handle_mouse_event(
                     Some(rspotify::model::PlayableItem::Unknown(_)) | None => None,
                 };
                 if let Some(duration) = duration {
-                    let position_ms = (duration.num_milliseconds()) * i64::from(event.column)
+                    let position_ms = (duration.num_milliseconds())
+                        * i64::from(event.column - rect.x)
                         / i64::from(rect.width);
                     client_pub.send(ClientRequest::Player(PlayerRequest::SeekTrack(
                         chrono::Duration::try_milliseconds(position_ms).unwrap(),
@@ -288,12 +289,14 @@ pub fn handle_action_in_context(
                     ..
                 } = ui.current_page()
                 {
-                    client_pub.send(ClientRequest::DeleteTrackFromPlaylist(
-                        playlist_id.clone_static(),
-                        track.id,
-                    ))?;
+                    ui.popup = Some(PopupState::ConfirmAction {
+                        message: format!("Delete {} from this playlist?", track.name),
+                        action: ConfirmableAction::DeleteTrackFromPlaylist {
+                            playlist_id: playlist_id.clone_static(),
+                            track_id: track.id,
+                        },
+                    });
                 }
-                ui.popup = None;
                 Ok(true)
             }
             _ => Ok(false),
@@ -317,8 +320,10 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
-                client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Album(album.id)))?;
-                ui.popup = None;
+                ui.popup = Some(PopupState::ConfirmAction {
+                    message: format!("Delete {} from your library?", album.name),
+                    action: ConfirmableAction::DeleteFromLibrary(ItemId::Album(album.id)),
+                });
                 Ok(true)
             }
             Action::CopyLink => {
@@ -375,10 +380,10 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
-                client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Playlist(
-                    playlist.id,
-                )))?;
-                ui.popup = None;
+                ui.popup = Some(PopupState::ConfirmAction {
+                    message: format!("Delete {} from your library?", playlist.name),
+                    action: ConfirmableAction::DeleteFromLibrary(ItemId::Playlist(playlist.id)),
+                });
                 Ok(true)
             }
             _ => Ok(false),
@@ -396,8 +401,10 @@ pub fn handle_action_in_context(
                 Ok(true)
             }
             Action::DeleteFromLibrary => {
-                client_pub.send(ClientRequest::DeleteFromLibrary(ItemId::Show(show.id)))?;
-                ui.popup = None;
+                ui.popup = Some(PopupState::ConfirmAction {
+                    message: format!("Delete {} from your library?", show.name),
+                    action: ConfirmableAction::DeleteFromLibrary(ItemId::Show(show.id)),
+                });
                 Ok(true)
             }
             _ => Ok(false),
@@ -624,6 +631,9 @@ fn handle_global_command(
         }
         Command::OpenCommandHelp => {
             ui.new_page(PageState::CommandHelp { scroll_offset: 0 });
+        }
+        Command::OpenLogs => {
+            ui.new_page(PageState::Logs { scroll_offset: 0 });
         }
         Command::RefreshPlayback => {
             client_pub.send(ClientRequest::GetCurrentPlayback)?;

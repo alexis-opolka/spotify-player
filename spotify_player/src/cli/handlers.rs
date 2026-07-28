@@ -28,21 +28,21 @@ fn receive_response(socket: &UdpSocket) -> Result<Response> {
 }
 
 fn get_id_or_name(args: &ArgMatches) -> IdOrName {
-    match args
-        .get_one::<Id>("id_or_name")
-        .expect("id_or_name group is required")
-        .as_str()
-    {
-        "name" => IdOrName::Name(
+    try_get_id_or_name(args).expect("id_or_name group is required")
+}
+
+fn try_get_id_or_name(args: &ArgMatches) -> Option<IdOrName> {
+    match args.get_one::<Id>("id_or_name")?.as_str() {
+        "name" => Some(IdOrName::Name(
             args.get_one::<String>("name")
                 .expect("name should be specified")
                 .to_owned(),
-        ),
-        "id" => IdOrName::Id(
+        )),
+        "id" => Some(IdOrName::Id(
             args.get_one::<String>("id")
                 .expect("id should be specified")
                 .to_owned(),
-        ),
+        )),
         id => panic!("unknown id: {id}"),
     }
 }
@@ -186,6 +186,14 @@ pub fn handle_cli_subcommand(cmd: &str, args: &ArgMatches) -> Result<()> {
     // handle commands that don't require a client separately
     match cmd {
         "authenticate" => {
+            // Force re-authentication of both credentials the application relies on:
+            // the Web API token and the librespot session credentials.
+            // Each runs its own interactive OAuth flow under a different client ID.
+            let mut api_client = client::new_api_client()?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(crate::auth::prompt_for_user_token(&mut api_client, true))
+                .context("authenticate Spotify Web API client")?;
+
             let auth_config = AuthConfig::new(configs)?;
             crate::auth::get_creds(&auth_config, true, false)?;
             std::process::exit(0);
@@ -223,6 +231,9 @@ pub fn handle_cli_subcommand(cmd: &str, args: &ArgMatches) -> Result<()> {
                 .get_one::<String>("query")
                 .expect("query is required")
                 .to_owned(),
+        },
+        "lyrics" => Request::Lyrics {
+            id_or_name: try_get_id_or_name(args),
         },
         _ => unreachable!(),
     };
@@ -374,7 +385,7 @@ fn print_features() {
     print_feature!("streaming");
     print_feature!("media-control");
     print_feature!("image");
-    print_feature!("viuer");
+    print_feature!("ratatui-image");
     print_feature!("sixel");
     print_feature!("pixelate");
     print_feature!("notify");

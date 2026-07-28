@@ -4,7 +4,7 @@ use crate::{
 };
 use ratatui::widgets::{ListState, TableState};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PageState {
     Library {
         state: LibraryPageUIState,
@@ -33,6 +33,9 @@ pub enum PageState {
     CommandHelp {
         scroll_offset: usize,
     },
+    Logs {
+        scroll_offset: usize,
+    },
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -44,9 +47,10 @@ pub enum PageType {
     Lyrics,
     Queue,
     CommandHelp,
+    Logs,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LibraryPageUIState {
     pub playlist_list: ListState,
     pub saved_album_list: ListState,
@@ -55,7 +59,7 @@ pub struct LibraryPageUIState {
     pub playlist_folder_id: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SearchPageUIState {
     pub track_list: ListState,
     pub album_list: ListState,
@@ -66,13 +70,13 @@ pub struct SearchPageUIState {
     pub focus: SearchFocusState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ContextPageType {
     CurrentPlaying,
     Browsing(ContextId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ContextPageUIState {
     Playlist {
         track_table: TableState,
@@ -84,6 +88,7 @@ pub enum ContextPageUIState {
         top_track_table: TableState,
         album_table: TableState,
         related_artist_list: ListState,
+        liked_track_table: TableState,
         focus: ArtistFocusState,
     },
     Tracks {
@@ -106,6 +111,7 @@ pub enum ArtistFocusState {
     TopTracks,
     Albums,
     RelatedArtists,
+    LikedSongs,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -119,7 +125,7 @@ pub enum SearchFocusState {
     Episodes,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BrowsePageUIState {
     CategoryList {
         state: ListState,
@@ -147,6 +153,7 @@ impl PageState {
             PageState::Lyrics { .. } => PageType::Lyrics,
             PageState::Queue { .. } => PageType::Queue,
             PageState::CommandHelp { .. } => PageType::CommandHelp,
+            PageState::Logs { .. } => PageType::Logs,
         }
     }
 
@@ -213,6 +220,7 @@ impl PageState {
                     top_track_table,
                     album_table,
                     related_artist_list,
+                    liked_track_table,
                     focus,
                 } => match focus {
                     ArtistFocusState::TopTracks => MutableWindowState::Table(top_track_table),
@@ -220,6 +228,7 @@ impl PageState {
                     ArtistFocusState::RelatedArtists => {
                         MutableWindowState::List(related_artist_list)
                     }
+                    ArtistFocusState::LikedSongs => MutableWindowState::Table(liked_track_table),
                 },
                 ContextPageUIState::Show { episode_table } => {
                     MutableWindowState::Table(episode_table)
@@ -232,9 +241,9 @@ impl PageState {
                 }
             },
             Self::Lyrics { .. } => None,
-            Self::CommandHelp { scroll_offset } | Self::Queue { scroll_offset } => {
-                Some(MutableWindowState::Scroll(scroll_offset))
-            }
+            Self::CommandHelp { scroll_offset }
+            | Self::Queue { scroll_offset }
+            | Self::Logs { scroll_offset } => Some(MutableWindowState::Scroll(scroll_offset)),
         }
     }
 }
@@ -298,6 +307,7 @@ impl ContextPageUIState {
             top_track_table: TableState::default(),
             album_table: TableState::default(),
             related_artist_list: ListState::default(),
+            liked_track_table: TableState::default(),
             focus: ArtistFocusState::TopTracks,
         }
     }
@@ -419,7 +429,8 @@ impl_focusable!(
 
 impl_focusable!(
     ArtistFocusState,
-    [TopTracks, Albums],
+    [TopTracks, LikedSongs],
+    [LikedSongs, Albums],
     [Albums, RelatedArtists],
     [RelatedArtists, TopTracks]
 );

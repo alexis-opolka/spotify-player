@@ -17,6 +17,7 @@ use std::{
     sync::OnceLock,
 };
 
+use anyhow::Context;
 use keymap::KeymapConfig;
 use theme::ThemeConfig;
 
@@ -50,7 +51,7 @@ impl Configs {
 /// Application configurations
 pub struct AppConfig {
     pub theme: String,
-    pub client_id: Option<String>,
+    pub client_id: String,
     pub client_id_command: Option<Command>,
 
     pub client_port: u16,
@@ -102,8 +103,6 @@ pub struct AppConfig {
     pub cover_img_length: usize,
     #[cfg(feature = "image")]
     pub cover_img_width: usize,
-    #[cfg(feature = "image")]
-    pub cover_img_scale: f32,
     #[cfg(feature = "pixelate")]
     pub cover_img_pixels: u32,
 
@@ -112,12 +111,13 @@ pub struct AppConfig {
 
     pub enable_streaming: StreamingType,
 
+    #[cfg(feature = "streaming")]
+    pub enable_audio_visualization: bool,
+
     #[cfg(feature = "notify")]
     pub enable_notify: bool,
 
     pub enable_cover_image_cache: bool,
-
-    pub default_device: String,
 
     pub device: DeviceConfig,
 
@@ -130,6 +130,20 @@ pub struct AppConfig {
 
     pub volume_scroll_step: u8,
     pub enable_mouse_scroll_volume: bool,
+
+    /// Enable app-managed queue for full playlist playback.
+    /// Requires streaming. When disabled, playback uses Spotify-native queue
+    /// management.
+    pub custom_queue: bool,
+
+    pub enable_relative_line_number: bool,
+
+    /// Start the application with playback paused instead of resuming the
+    /// previous session. Requires streaming. When the integrated client
+    /// connects on startup, Spotify may restore and auto-resume the last
+    /// playing track; enabling this pauses that auto-started playback once.
+    #[cfg(feature = "streaming")]
+    pub pause_on_startup: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -285,7 +299,7 @@ impl Default for AppConfig {
             //
             // [extended quota mode]: https://developer.spotify.com/documentation/web-api/concepts/quota-modes
             // [spotify API changes]: https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api
-            client_id: Some(NCSPOT_CLIENT_ID.to_string()),
+            client_id: NCSPOT_CLIENT_ID.to_string(),
             client_id_command: None,
 
             client_port: 8080,
@@ -338,12 +352,11 @@ impl Default for AppConfig {
 
             genre_num: 2,
 
+            // `0` means "auto": derive the cover's column count from the terminal's cell aspect ratio
             #[cfg(feature = "image")]
-            cover_img_length: 9,
+            cover_img_length: 0,
             #[cfg(feature = "image")]
             cover_img_width: 5,
-            #[cfg(feature = "image")]
-            cover_img_scale: 1.0,
             #[cfg(feature = "pixelate")]
             cover_img_pixels: 16,
 
@@ -360,12 +373,13 @@ impl Default for AppConfig {
 
             enable_streaming: StreamingType::Always,
 
+            #[cfg(feature = "streaming")]
+            enable_audio_visualization: false,
+
             #[cfg(feature = "notify")]
             enable_notify: true,
 
             enable_cover_image_cache: true,
-
-            default_device: "spotify-player".to_string(),
 
             device: DeviceConfig::default(),
 
@@ -378,6 +392,13 @@ impl Default for AppConfig {
 
             volume_scroll_step: 5,
             enable_mouse_scroll_volume: true,
+
+            custom_queue: true,
+
+            enable_relative_line_number: false,
+
+            #[cfg(feature = "streaming")]
+            pause_on_startup: false,
         }
     }
 }
@@ -471,10 +492,10 @@ impl AppConfig {
         }
     }
 
-    /// Returns stdout of `client_id_command` if set, otherwise it returns the the value of `client_id`
-    pub fn get_user_client_id(&self) -> Result<Option<String>> {
+    /// Returns stdout of `client_id_command` if set, otherwise the value of `client_id`.
+    pub fn get_client_id(&self) -> Result<String> {
         match self.client_id_command {
-            Some(ref cmd) => cmd.execute(None).map(|out| Some(out.trim().to_string())),
+            Some(ref cmd) => cmd.execute(None).map(|out| out.trim().to_string()),
             None => Ok(self.client_id.clone()),
         }
     }
@@ -503,4 +524,37 @@ pub fn set_config(configs: Configs) {
     CONFIGS
         .set(configs)
         .expect("configs should be initialized only once");
+}
+
+// Apply a CLI config override to the application config.
+// Serializes the config to TOML, navigates to the key via dot-notation,
+// overrides the value, and deserializes back into AppConfig.
+// Returns an error if the key path is invalid or the value type mismatches.
+pub fn apply_config_override(config: &mut AppConfig, key: &str, value: &str) -> anyhow::Result<()> {
+    let mut config_value = toml::Value::try_from(&*config)?;
+
+    let parts: Vec<&str> = key.split('.').collect();
+    let mut current = &mut config_value;
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            let table = current
+                .as_table_mut()
+                .context(format!("'{key}' is not a valid config path"))?;
+
+            let parsed_value: toml::Value = value
+                .parse()
+                .unwrap_or_else(|_| toml::Value::String(value.to_string()));
+
+            table.insert(part.to_string(), parsed_value);
+        } else {
+            current = current
+                .get_mut(part)
+                .context(format!("Config key '{part}' not found in path '{key}'"))?;
+        }
+    }
+
+    *config = config_value.try_into()?;
+
+    Ok(())
 }
