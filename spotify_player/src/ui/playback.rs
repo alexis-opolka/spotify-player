@@ -137,7 +137,7 @@ pub fn render_playback_window(
             render_playback_progress_bar(frame, ui, progress, duration, progress_bar_rect);
             #[cfg(feature = "streaming")]
             if let Some(vis_r) = vis_rect {
-                super::streaming::render_audio_visualization(frame, state, vis_r);
+                super::streaming::render_audio_visualization(frame, state, &ui.theme, vis_r);
             }
             return other_rect;
         }
@@ -320,6 +320,7 @@ fn construct_playback_text(
                     to_bidi_string(&crate::utils::map_join(&track.artists, |a| &a.name, ", ")),
                     ui.theme.playback_artists(),
                 ),
+                #[allow(deprecated)]
                 rspotify::model::PlayableItem::Episode(episode) => {
                     (episode.show.publisher.clone(), ui.theme.playback_artists())
                 }
